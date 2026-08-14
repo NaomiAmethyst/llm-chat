@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 // llm-chat is a minimal terminal chat client for OpenAI-compatible endpoints
-// (OpenRouter, OpenClaw, Ollama, vLLM, llama.cpp, ...). No tools, no TUI, no
-// dependencies: a raw-mode multi-line editor, streamed responses with ANSI
-// markdown highlighting, token accounting, conversation save/load, and full
-// control of the system prompt.
+// (OpenRouter, OpenClaw, Ollama, vLLM, llama.cpp, ...). No tools, no TUI,
+// and only golang.org/x/{term,sys} as dependencies: a raw-mode multi-line
+// editor, streamed responses with ANSI markdown highlighting, token
+// accounting, conversation save/load, and full control of the system prompt.
 package main
 
 import (
@@ -21,9 +21,10 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
-	"unsafe"
+
+	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 )
 
 // ---------------------------------------------------------------------------
@@ -43,19 +44,15 @@ func disableColors() {
 }
 
 func isTerminal(fd uintptr) bool {
-	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
-	return errno == 0
+	return term.IsTerminal(int(fd))
 }
 
 // stdinHasData reports whether stdin has bytes ready within the timeout.
 // The editor uses it to batch redraws during pastes, to tell a typed Enter
 // from a pasted newline, and to tell a bare Esc from an escape sequence.
 func stdinHasData(d time.Duration) bool {
-	var fds syscall.FdSet
-	fds.Bits[0] = 1 // fd 0
-	tv := syscall.NsecToTimeval(int64(d))
-	n, err := syscall.Select(1, &fds, nil, nil, &tv)
+	fds := []unix.PollFd{{Fd: 0, Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, int(d.Milliseconds()))
 	return err == nil && n > 0
 }
 
@@ -70,34 +67,12 @@ func stdinHasData(d time.Duration) bool {
 
 const batchWait = 2 * time.Millisecond
 
-func ioctlTermios(fd, req uintptr, t *syscall.Termios) syscall.Errno {
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(unsafe.Pointer(t)))
-	return errno
-}
-
-func makeRaw(fd uintptr) (*syscall.Termios, error) {
-	var old syscall.Termios
-	if errno := ioctlTermios(fd, syscall.TCGETS, &old); errno != 0 {
-		return nil, errno
-	}
-	raw := old
-	raw.Lflag &^= syscall.ICANON | syscall.ECHO | syscall.ISIG | syscall.IEXTEN
-	raw.Iflag &^= syscall.IXON | syscall.ICRNL
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
-	if errno := ioctlTermios(fd, syscall.TCSETS, &raw); errno != 0 {
-		return nil, errno
-	}
-	return &old, nil
-}
-
 func termWidth() int {
-	var w struct{ rows, cols, x, y uint16 }
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, os.Stdout.Fd(), syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(&w)))
-	if errno != 0 || w.cols == 0 {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 {
 		return 80
 	}
-	return int(w.cols)
+	return w
 }
 
 type vpos struct{ row, col int }
@@ -309,12 +284,12 @@ func (e *editor) handleEscape() {
 // edit reads one message; eof is true when the user exits (Ctrl+D on an empty
 // buffer, or stdin closing).
 func (e *editor) edit() (msg string, eof bool) {
-	old, err := makeRaw(os.Stdin.Fd())
+	old, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot enter raw mode: %v\n", err)
 		return "", true
 	}
-	defer ioctlTermios(os.Stdin.Fd(), syscall.TCSETS, old)
+	defer term.Restore(int(os.Stdin.Fd()), old)
 	e.buf, e.cur, e.lastRow = e.buf[:0], 0, 0
 	e.render()
 	for {

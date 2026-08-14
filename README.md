@@ -2,14 +2,16 @@
 
 A minimal terminal chat client for OpenAI-compatible endpoints — OpenRouter,
 OpenClaw, Ollama, vLLM, llama.cpp, LM Studio, and anything else that speaks
-`/chat/completions`. Single static binary, no dependencies, no tools, no TUI.
+`/chat/completions`. Single static binary, no tools, no TUI, and only
+`golang.org/x/term` + `golang.org/x/sys` as dependencies.
 
-Linux only: it drives the terminal through raw termios/ioctl syscalls
-directly.
+Runs on Linux and macOS (other Unixes supported by `x/term` will likely work
+too).
 
 ## Build
 
-Requires Go 1.24+:
+Requires Go 1.25+ (older toolchains with `GOTOOLCHAIN=auto`, the default,
+fetch it automatically):
 
 ```sh
 go build -o llm-chat .
@@ -209,6 +211,9 @@ reports none, a `~`-prefixed estimate (~4 chars/token) is used instead.
   dimmed and are not added to history.
 - Do not wrap it in `rlwrap` — the built-in editor needs the terminal in raw
   mode and provides its own line editing.
+- Stock macOS Terminal.app does not render the ANSI italic attribute
+  (`*italic*` spans lose their slant there); iTerm2, Ghostty, kitty, etc.
+  render everything.
 
 ## License
 
