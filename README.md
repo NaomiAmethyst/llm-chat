@@ -1,5 +1,7 @@
 # llm-chat
 
+[![CI](https://github.com/NaomiAmethyst/llm-chat/actions/workflows/ci.yml/badge.svg)](https://github.com/NaomiAmethyst/llm-chat/actions/workflows/ci.yml)
+
 A minimal terminal chat client for OpenAI-compatible endpoints — OpenRouter,
 OpenClaw, Ollama, vLLM, llama.cpp, LM Studio, and anything else that speaks
 `/chat/completions`. Single static binary, no tools, no TUI, and only
@@ -15,6 +17,12 @@ fetch it automatically):
 
 ```sh
 go build -o llm-chat .
+```
+
+Or install straight from GitHub:
+
+```sh
+go install github.com/NaomiAmethyst/llm-chat@latest
 ```
 
 ## Usage
@@ -216,5 +224,7 @@ reports none, a `~`-prefixed estimate (~4 chars/token) is used instead.
   render everything.
 
 ## License
+
+Copyright © 2026 Naomi Persephone Amethyst <naomi@amethyst.name>
 
 GPL-3.0 — see [LICENSE](LICENSE).

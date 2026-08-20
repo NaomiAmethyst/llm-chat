@@ -1,4 +1,4 @@
-module llm-chat
+module github.com/NaomiAmethyst/llm-chat
 
 go 1.25.0
 

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Naomi Persephone Amethyst <naomi@amethyst.name>
 
 // llm-chat is a minimal terminal chat client for OpenAI-compatible endpoints
 // (OpenRouter, OpenClaw, Ollama, vLLM, llama.cpp, ...). No tools, no TUI,
