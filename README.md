@@ -146,6 +146,15 @@ file name writes a human-readable markdown transcript. Restore a JSON save
 with `/load chat.json`, or at startup with `-load chat.json` (works in
 non-interactive mode too, so a script can continue a saved conversation).
 
+A JSON save restores the **endpoint** it was recorded with, so a conversation
+held against a local endpoint is never replayed to a different one by
+accident. An explicit `-url` (or `$LLM_CHAT_BASE_URL`) always wins, and the
+API key is re-resolved for whichever endpoint ends up in use — the OpenClaw
+gateway token is only ever sent to the gateway. Since a save file names the
+endpoint it will be sent to, treat conversation files like any other config
+you execute: load ones you trust. Pasted transcripts record no endpoint and
+can never redirect one.
+
 `/load` also understands a transcript **copied straight from the terminal**:
 it rebuilds messages from the `you ❯` / `◆ model` markers and takes
 timestamps from the `[sent: …]` / `[recv: …]` lines (banner, rules, and
@@ -216,7 +225,13 @@ reports none, a `~`-prefixed estimate (~4 chars/token) is used instead.
   harness adds), and no requests are made beyond `/chat/completions` and
   `/models`.
 - Reasoning-model "thinking" deltas (OpenRouter's `delta.reasoning`) are shown
-  dimmed and are not added to history.
+  dimmed, with every line prefixed by a `┊` marker, and are never added to
+  history — `/load` skips those lines too, so copying a transcript back in
+  restores the answer without the reasoning.
+- Text from the endpoint is stripped of control characters before it reaches
+  the terminal in every output mode, so a hostile or malfunctioning endpoint
+  cannot repaint the screen, set the window title, or drive the clipboard
+  through escape sequences.
 - Do not wrap it in `rlwrap` — the built-in editor needs the terminal in raw
   mode and provides its own line editing.
 - Stock macOS Terminal.app does not render the ANSI italic attribute

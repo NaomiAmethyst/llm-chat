@@ -42,6 +42,32 @@ func init() {
 	}
 }
 
+// isControl reports whether r is a control character that must never reach a
+// terminal verbatim. Newlines and tabs are legitimate content and are kept;
+// everything else in C0/C1 (ESC above all) can drive ANSI/OSC sequences that
+// repaint the screen, set the window title, or write the clipboard.
+func isControl(r rune) bool {
+	return (r < 0x20 && r != '\n' && r != '\t') || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+// sanitize strips control characters from endpoint-supplied text. The colored
+// renderer drops them as a side effect of laying out each line; plain output,
+// reasoning, model ids, and API error strings go through here instead, so an
+// untrusted endpoint cannot drive the terminal in any output mode.
+func sanitize(s string) string {
+	if !strings.ContainsFunc(s, isControl) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if !isControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // ansiEmitter builds a line's output, wrapping visible runes manually at the
 // terminal width so color codes never affect cursor arithmetic.
 type ansiEmitter struct {
@@ -80,7 +106,7 @@ func newMdWriter(live bool) *mdWriter { return &mdWriter{plain: cReset == "", li
 
 func (m *mdWriter) WriteString(s string) {
 	if m.plain {
-		os.Stdout.WriteString(s)
+		os.Stdout.WriteString(sanitize(s))
 		return
 	}
 	var raw strings.Builder
@@ -96,7 +122,7 @@ func (m *mdWriter) WriteString(s string) {
 			for i := 0; i < 4; i++ {
 				m.echoRune(' ', &raw)
 			}
-		case r == '\r' || r < 0x20:
+		case isControl(r):
 			// strip carriage returns and stray control characters
 		default:
 			m.echoRune(r, &raw)

@@ -454,6 +454,8 @@ type Session struct {
 	maxTokens   int     // 0 means unset
 	stream      bool
 	interactive bool
+	urlLocked   bool   // -url was given explicitly: never overridden by a load
+	keyLocked   bool   // -key was given explicitly: never re-resolved
 	defaultSys  string // the built default system prompt, for "/system default"
 	sysExpanded string // system prompt with placeholders expanded, refreshed
 	// only when the system prompt or model changes so the request prefix
@@ -497,6 +499,37 @@ func withCommas(n int) string {
 		s = s[:i] + "," + s[i:]
 	}
 	return s
+}
+
+// gatewayURL is the local OpenClaw gateway, whose token is only ever sent
+// there — never to whatever endpoint a loaded conversation happens to name.
+const gatewayURL = "http://127.0.0.1:18789"
+
+// resolveKey picks the API key for the current endpoint from the environment.
+// An explicit -key always wins; otherwise the choice is endpoint-specific, so
+// it must be redone whenever the endpoint changes.
+func (s *Session) resolveKey() {
+	if s.keyLocked {
+		return
+	}
+	keys := []string{"LLM_CHAT_API_KEY"}
+	if strings.HasPrefix(s.baseURL, gatewayURL) {
+		keys = append(keys, "OPENCLAW_GATEWAY_TOKEN")
+	}
+	keys = append(keys, "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+	s.apiKey = envOr(keys, "")
+}
+
+// setEndpoint switches endpoints and re-resolves the credential for the new
+// one. It reports whether the endpoint actually changed.
+func (s *Session) setEndpoint(u string) bool {
+	u = strings.TrimRight(u, "/")
+	if u == "" || u == s.baseURL {
+		return false
+	}
+	s.baseURL = u
+	s.resolveKey()
+	return true
 }
 
 // expand substitutes {model}, {endpoint}, {date}, and {time} placeholders.
@@ -550,9 +583,54 @@ func httpError(resp *http.Response) error {
 		Error *apiError `json:"error"`
 	}
 	if json.Unmarshal(body, &e) == nil && e.Error != nil && e.Error.Message != "" {
-		return fmt.Errorf("%s: %s", resp.Status, e.Error.Message)
+		return fmt.Errorf("%s: %s", resp.Status, sanitize(e.Error.Message))
 	}
-	return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	return fmt.Errorf("%s: %s", resp.Status, sanitize(strings.TrimSpace(string(body))))
+}
+
+// reasoningMark prefixes every streamed reasoning line. It keeps reasoning
+// visually distinct from the answer and, because parseTranscript skips lines
+// carrying it, stops copied reasoning from being reloaded as assistant text.
+const reasoningMark = "\u250a"
+
+// reasoningWriter prints reasoning deltas dimmed and line-prefixed. Reasoning
+// is display-only: it never enters the conversation history.
+type reasoningWriter struct {
+	active      bool
+	atLineStart bool
+}
+
+func newReasoningWriter() *reasoningWriter {
+	return &reasoningWriter{atLineStart: true}
+}
+
+func (w *reasoningWriter) write(s string) {
+	var b strings.Builder
+	for _, r := range sanitize(s) {
+		if w.atLineStart {
+			b.WriteString(cDim + reasoningMark + " ")
+			w.atLineStart, w.active = false, true
+		}
+		if r == '\n' {
+			b.WriteString(cReset + "\n")
+			w.atLineStart = true
+			continue
+		}
+		b.WriteRune(r)
+	}
+	os.Stdout.WriteString(b.String())
+}
+
+// end closes an open reasoning block, leaving a blank line before the answer.
+func (w *reasoningWriter) end() {
+	if !w.active {
+		return
+	}
+	if !w.atLineStart {
+		os.Stdout.WriteString(cReset + "\n")
+	}
+	os.Stdout.WriteString("\n")
+	w.active, w.atLineStart = false, true
 }
 
 // send performs one chat completion, printing the response as it arrives.
@@ -609,55 +687,73 @@ func (s *Session) send(ctx context.Context) (string, *Usage, error) {
 	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var full strings.Builder
 	var usage *Usage
-	inReasoning := false
-	endReasoning := func() {
-		if inReasoning {
-			fmt.Print(cReset + "\n\n")
-			inReasoning = false
+	var event strings.Builder // data: payload of the SSE event being read
+	rw := newReasoningWriter()
+	done := false
+
+	// dispatch handles one complete SSE event. Malformed JSON is reported
+	// rather than skipped: dropping a chunk would silently lose answer text.
+	dispatch := func() error {
+		data := strings.TrimSuffix(event.String(), "\n")
+		event.Reset()
+		if data == "" {
+			return nil
 		}
-	}
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, ":") { // SSE keepalive comments
-			continue
-		}
-		data, ok := strings.CutPrefix(line, "data:")
-		if !ok {
-			continue
-		}
-		data = strings.TrimSpace(data)
-		if data == "[DONE]" {
-			break
+		if strings.TrimSpace(data) == "[DONE]" {
+			done = true
+			return nil
 		}
 		var ck streamChunk
-		if json.Unmarshal([]byte(data), &ck) != nil {
-			continue
+		if err := json.Unmarshal([]byte(data), &ck); err != nil {
+			return fmt.Errorf("malformed streaming event: %w", err)
 		}
 		if ck.Error != nil {
-			endReasoning()
-			return full.String(), usage, errors.New(ck.Error.Message)
+			return errors.New(sanitize(ck.Error.Message))
 		}
 		if ck.Usage != nil {
 			usage = ck.Usage
 		}
 		if len(ck.Choices) == 0 {
-			continue
+			return nil
 		}
 		d := ck.Choices[0].Delta
 		if d.Reasoning != "" && s.interactive {
-			if !inReasoning {
-				fmt.Print(cDim)
-				inReasoning = true
-			}
-			fmt.Print(d.Reasoning)
+			rw.write(d.Reasoning)
 		}
 		if d.Content != "" {
-			endReasoning()
+			rw.end()
 			mw.WriteString(d.Content)
 			full.WriteString(d.Content)
 		}
+		return nil
 	}
-	endReasoning()
+
+	// An SEE event ends at a blank line; its data may span several data:
+	// lines, which the spec joins with newlines.
+	for !done && sc.Scan() {
+		line := strings.TrimRight(sc.Text(), "\r")
+		switch {
+		case line == "":
+			if err := dispatch(); err != nil {
+				rw.end()
+				return full.String(), usage, err
+			}
+		case strings.HasPrefix(line, ":"): // comment / keepalive
+		default:
+			if v, ok := strings.CutPrefix(line, "data:"); ok {
+				event.WriteString(strings.TrimPrefix(v, " "))
+				event.WriteByte('\n')
+			}
+			// other SSE fields (event:, id:, retry:) carry no payload
+		}
+	}
+	if !done { // a stream may end without a final blank line
+		if err := dispatch(); err != nil {
+			rw.end()
+			return full.String(), usage, err
+		}
+	}
+	rw.end()
 	if err := sc.Err(); err != nil {
 		return full.String(), usage, err
 	}
@@ -758,7 +854,7 @@ func (s *Session) fetchModels(ctx context.Context) ([]string, error) {
 	}
 	ids := make([]string, 0, len(out.Data))
 	for _, m := range out.Data {
-		ids = append(ids, m.ID)
+		ids = append(ids, sanitize(m.ID)) // ids reach the terminal and the prompt
 	}
 	return ids, nil
 }
@@ -840,6 +936,15 @@ func (s *Session) saveJSON(path string) error {
 
 // apply replaces the session's conversation state and returns a summary.
 func (s *Session) apply(c savedChat) string {
+	// A saved conversation records the endpoint it was held with. Restoring it
+	// keeps history, model, and endpoint consistent instead of replaying a
+	// local conversation against whatever endpoint happens to be the default;
+	// an explicit -url still wins, and the credential is re-resolved for the
+	// endpoint actually being used.
+	endpointChanged := false
+	if c.Endpoint != "" && !s.urlLocked {
+		endpointChanged = s.setEndpoint(c.Endpoint)
+	}
 	if c.System != nil {
 		s.system = *c.System
 	}
@@ -860,6 +965,9 @@ func (s *Session) apply(c savedChat) string {
 	s.lastPrompt = 0
 	s.refreshSystem()
 	summary := fmt.Sprintf("loaded %d messages", len(s.history))
+	if endpointChanged {
+		summary += "; endpoint " + s.baseURL
+	}
 	if c.Model != "" {
 		summary += "; model " + s.model
 	}
@@ -952,6 +1060,8 @@ func parseTranscript(text string) (*savedChat, error) {
 			state = ""
 		case state == "system":
 			sysLines = append(sysLines, ln)
+		case state == "assistant" && strings.HasPrefix(t, reasoningMark):
+			// display-only reasoning; never part of the answer
 		case state == "user" || state == "assistant":
 			curLines = append(curLines, ln)
 		}
@@ -1225,10 +1335,15 @@ func main() {
 	flag.Parse()
 
 	interactive := *interactiveF
-	colorSet := false
+	var colorSet, urlSet, keySet bool
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "color" {
+		switch f.Name {
+		case "color":
 			colorSet = true
+		case "url":
+			urlSet = true
+		case "key":
+			keySet = true
 		}
 	})
 	color := *colorF
@@ -1239,14 +1354,6 @@ func main() {
 		disableColors()
 	}
 
-	if *apiKey == "" {
-		keys := []string{"LLM_CHAT_API_KEY"}
-		if strings.HasPrefix(*baseURL, "http://127.0.0.1:18789") {
-			keys = append(keys, "OPENCLAW_GATEWAY_TOKEN")
-		}
-		keys = append(keys, "OPENROUTER_API_KEY", "OPENAI_API_KEY")
-		*apiKey = envOr(keys, "")
-	}
 	builtDefault := buildDefaultSystem(color, interactive)
 	var sys string
 	switch *system {
@@ -1265,15 +1372,18 @@ func main() {
 	s := &Session{
 		client:      &http.Client{},
 		baseURL:     strings.TrimRight(*baseURL, "/"),
-		apiKey:      *apiKey,
+		apiKey:      *apiKey, // resolveKey fills this in when -key was absent
 		model:       *model,
 		system:      sys,
 		temperature: *temperature,
 		maxTokens:   *maxTokens,
 		stream:      !*noStream,
 		interactive: interactive,
+		urlLocked:   urlSet || os.Getenv("LLM_CHAT_BASE_URL") != "",
+		keyLocked:   keySet,
 		defaultSys:  builtDefault,
 	}
+	s.resolveKey()
 
 	var loadSummary string
 	if *loadPath != "" {
