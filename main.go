@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -454,10 +455,13 @@ type Session struct {
 	maxTokens   int     // 0 means unset
 	stream      bool
 	interactive bool
-	urlLocked   bool   // -url was given explicitly: never overridden by a load
-	keyLocked   bool   // -key was given explicitly: never re-resolved
-	defaultSys  string // the built default system prompt, for "/system default"
-	sysExpanded string // system prompt with placeholders expanded, refreshed
+	urlLocked   bool          // -url was given explicitly: never overridden by a load
+	keyLocked   bool          // -key/-key-cmd was given: env never overrides it
+	keyCmd      string        // -key-cmd: shell command printing the API key
+	keyTTL      time.Duration // -key-ttl: refresh the key before it expires
+	keyFetched  time.Time     // when -key-cmd last produced a key
+	defaultSys  string        // the built default system prompt, for "/system default"
+	sysExpanded string        // system prompt with placeholders expanded, refreshed
 	// only when the system prompt or model changes so the request prefix
 	// stays stable (and cacheable by the provider) across turns
 	history []histMsg
@@ -505,11 +509,86 @@ func withCommas(n int) string {
 // there — never to whatever endpoint a loaded conversation happens to name.
 const gatewayURL = "http://127.0.0.1:18789"
 
+// keyCmdTimeout is generous: a credential helper may prompt for a passphrase
+// or a hardware-key touch before it prints anything.
+const keyCmdTimeout = 2 * time.Minute
+
+// runKeyCmd executes -key-cmd and returns the key it prints. The command runs
+// through the shell so pipelines and helpers ("pass show …", "op read …")
+// work as written; $LLM_CHAT_ENDPOINT tells it which endpoint the key is for.
+// Only the first line is used: helpers commonly print the secret first and
+// metadata after.
+func (s *Session) runKeyCmd() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), keyCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", s.keyCmd)
+	cmd.Env = append(os.Environ(), "LLM_CHAT_ENDPOINT="+s.baseURL)
+	cmd.Stdin = os.Stdin // let helpers prompt on the terminal
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("%w: %s", err, sanitize(msg))
+		}
+		return "", err
+	}
+	key, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	if key = strings.TrimSpace(key); key == "" {
+		return "", errors.New("command produced no key")
+	}
+	return key, nil
+}
+
+// initKey fetches the starting key from -key-cmd.
+func (s *Session) initKey() error {
+	key, err := s.runKeyCmd()
+	if err != nil {
+		return err
+	}
+	s.apiKey, s.keyFetched = key, time.Now()
+	return nil
+}
+
+// refreshKey re-runs -key-cmd and adopts the key if it differs from the one
+// in use. It reports whether the key changed, which is what makes retrying a
+// failed request worthwhile.
+func (s *Session) refreshKey() bool {
+	if s.keyCmd == "" {
+		return false
+	}
+	key, err := s.runKeyCmd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%swarning:%s -key-cmd failed: %v\n", cRed, cReset, err)
+		return false
+	}
+	s.keyFetched = time.Now()
+	if key == s.apiKey {
+		return false
+	}
+	s.apiKey = key
+	return true
+}
+
+// refreshKeyIfStale renews a -key-cmd key that has outlived -key-ttl, before
+// it is used. This is the proactive half of key handling: set the TTL below
+// the credential's lifetime and requests never fail on an expired key; leave
+// it unset and the failure-triggered refresh in send is the only backstop.
+func (s *Session) refreshKeyIfStale() {
+	if s.keyCmd == "" || s.keyTTL <= 0 {
+		return
+	}
+	if !s.keyFetched.IsZero() && time.Since(s.keyFetched) < s.keyTTL {
+		return
+	}
+	s.refreshKey()
+}
+
 // resolveKey picks the API key for the current endpoint from the environment.
 // An explicit -key always wins; otherwise the choice is endpoint-specific, so
 // it must be redone whenever the endpoint changes.
 func (s *Session) resolveKey() {
-	if s.keyLocked {
+	if s.keyLocked { // includes -key-cmd, whose key is refreshed on demand
 		return
 	}
 	keys := []string{"LLM_CHAT_API_KEY"}
@@ -528,6 +607,9 @@ func (s *Session) setEndpoint(u string) bool {
 		return false
 	}
 	s.baseURL = u
+	// A -key-cmd key is kept across the switch; if it turns out to be wrong
+	// for the new endpoint, the first failed request refreshes it with
+	// $LLM_CHAT_ENDPOINT set to the new value.
 	s.resolveKey()
 	return true
 }
@@ -635,7 +717,21 @@ func (w *reasoningWriter) end() {
 
 // send performs one chat completion, printing the response as it arrives.
 // Returns the full assistant text (possibly partial on error/interrupt).
+//
+// On failure it gives -key-cmd a chance to supply a rotated key and retries
+// once. The retry is skipped when the request was cancelled or had already
+// printed part of an answer, since re-sending would duplicate it.
 func (s *Session) send(ctx context.Context) (string, *Usage, error) {
+	s.refreshKeyIfStale()
+	content, usage, err := s.sendOnce(ctx)
+	if err == nil || content != "" || ctx.Err() != nil || !s.refreshKey() {
+		return content, usage, err
+	}
+	fmt.Fprintf(os.Stderr, "%s[key refreshed; retrying]%s\n", cDim, cReset)
+	return s.sendOnce(ctx)
+}
+
+func (s *Session) sendOnce(ctx context.Context) (string, *Usage, error) {
 	creq := chatRequest{Model: s.model, Messages: s.messages(), Stream: s.stream}
 	if s.stream {
 		creq.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -830,8 +926,18 @@ func (s *Session) runTurn(sigc chan os.Signal) {
 	}
 }
 
-// fetchModels returns the endpoint's model ids in the order the API lists them.
+// fetchModels returns the endpoint's model ids in the order the API lists
+// them, retrying once if -key-cmd yields a fresh key after a failure.
 func (s *Session) fetchModels(ctx context.Context) ([]string, error) {
+	s.refreshKeyIfStale()
+	ids, err := s.fetchModelsOnce(ctx)
+	if err == nil || ctx.Err() != nil || !s.refreshKey() {
+		return ids, err
+	}
+	return s.fetchModelsOnce(ctx)
+}
+
+func (s *Session) fetchModelsOnce(ctx context.Context) ([]string, error) {
 	req, err := s.newRequest(ctx, "GET", "/models", nil)
 	if err != nil {
 		return nil, err
@@ -1306,6 +1412,20 @@ func runNonInteractive(s *Session, initial string, sigc chan os.Signal) {
 	}
 }
 
+// envDuration reads a duration ("55m", "3600s") from the environment.
+func envDuration(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: ignoring $%s: %v\n", key, err)
+		return 0
+	}
+	return d
+}
+
 func envOr(keys []string, fallback string) string {
 	for _, k := range keys {
 		if v := os.Getenv(k); v != "" {
@@ -1322,7 +1442,11 @@ func main() {
 	}
 	baseURL := flag.String("url", envOr([]string{"LLM_CHAT_BASE_URL"}, defaultURL),
 		"API base URL of an OpenAI-compatible endpoint (default: the local OpenClaw gateway if $OPENCLAW_GATEWAY_TOKEN is set, else OpenRouter)")
-	apiKey := flag.String("key", "", "API key (default: $LLM_CHAT_API_KEY; $OPENCLAW_GATEWAY_TOKEN when talking to the gateway; then $OPENROUTER_API_KEY, $OPENAI_API_KEY)")
+	apiKey := flag.String("key", "", "API key (default: -key-cmd if given, else $LLM_CHAT_API_KEY; $OPENCLAW_GATEWAY_TOKEN when talking to the gateway; then $OPENROUTER_API_KEY, $OPENAI_API_KEY)")
+	keyCmd := flag.String("key-cmd", os.Getenv("LLM_CHAT_KEY_CMD"),
+		"shell command printing the API key; re-run to pick up a rotated key when a request fails")
+	keyTTL := flag.Duration("key-ttl", envDuration("LLM_CHAT_KEY_TTL"),
+		"re-run -key-cmd once the cached key is older than this, e.g. 55m ($LLM_CHAT_KEY_TTL); 0 refreshes only after a failed request")
 	model := flag.String("model", envOr([]string{"LLM_CHAT_MODEL"}, ""), "model id (default: the first model the endpoint lists; see /models)")
 	system := flag.String("system", "", "system prompt, @file to load from a file, or \"none\" for no system prompt (default: a generic built-in prompt)")
 	temperature := flag.Float64("temperature", -1, "sampling temperature (endpoint default if unset)")
@@ -1380,10 +1504,25 @@ func main() {
 		stream:      !*noStream,
 		interactive: interactive,
 		urlLocked:   urlSet || os.Getenv("LLM_CHAT_BASE_URL") != "",
-		keyLocked:   keySet,
+		keyLocked:   keySet || *keyCmd != "",
+		keyCmd:      *keyCmd,
+		keyTTL:      *keyTTL,
 		defaultSys:  builtDefault,
 	}
 	s.resolveKey()
+	if s.keyTTL < 0 {
+		fmt.Fprintln(os.Stderr, "error: -key-ttl cannot be negative")
+		os.Exit(1)
+	}
+	if s.keyTTL > 0 && s.keyCmd == "" {
+		fmt.Fprintf(os.Stderr, "%swarning:%s -key-ttl has no effect without -key-cmd\n", cRed, cReset)
+	}
+	if s.keyCmd != "" { // -key-cmd is the key source; -key only seeds it
+		if err := s.initKey(); err != nil {
+			fmt.Fprintf(os.Stderr, "error: -key-cmd failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	var loadSummary string
 	if *loadPath != "" {

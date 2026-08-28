@@ -50,6 +50,8 @@ git diff | ./llm-chat -system "write a commit message"
 |---|---|---|
 | `-url` | OpenRouter, or the OpenClaw gateway (see below) | API base URL (`$LLM_CHAT_BASE_URL`) |
 | `-key` | *(env)* | API key; falls back to `$LLM_CHAT_API_KEY`, `$OPENCLAW_GATEWAY_TOKEN` (gateway only), `$OPENROUTER_API_KEY`, `$OPENAI_API_KEY` |
+| `-key-cmd` | *(none)* | shell command printing the API key (`$LLM_CHAT_KEY_CMD`); re-run to pick up a rotated key when a request fails |
+| `-key-ttl` | `0` | re-run `-key-cmd` once the cached key is older than this, e.g. `55m` (`$LLM_CHAT_KEY_TTL`) |
 | `-model` | first model listed by the endpoint | model id (`$LLM_CHAT_MODEL`); list with `/models` |
 | `-system` | *(built-in)* | system prompt, `@file` to load from a file, or `none` for no system prompt |
 | `-temperature` | endpoint default | sampling temperature |
@@ -71,6 +73,46 @@ becomes the local OpenClaw gateway (`http://127.0.0.1:18789/v1`) with the
 token as the API key — so `export OPENCLAW_GATEWAY_TOKEN=…` followed by a
 bare `./llm-chat` just works. The token is only used as a key when talking
 to the gateway; an explicit `-url`/`-key` always wins.
+
+### Keys from a command
+
+`-key-cmd` takes a shell command that prints the API key, so short-lived or
+vaulted credentials never have to sit in the environment:
+
+```sh
+./llm-chat -key-cmd 'pass show openrouter/api-key'
+./llm-chat -key-cmd 'op read op://vault/openrouter/credential'
+./llm-chat -key-cmd 'gcloud auth print-access-token'
+```
+
+It runs once at startup, and again whenever a request fails: if the command
+then prints a **different** key, that request is retried once with it, which
+covers tokens that expire mid-session. If the key comes back unchanged the
+error is reported as-is rather than re-sending pointlessly, and a request
+that was cancelled or had already printed part of an answer is never
+retried. `/models` lookups refresh and retry the same way.
+
+`-key-ttl` adds the proactive half: set it below the credential's lifetime
+and the key is renewed *before* a request that would otherwise fail, so an
+expiring token costs no failed round trip at all.
+
+```sh
+./llm-chat -key-cmd 'gcloud auth print-access-token' -key-ttl 55m
+```
+
+The two work together — the TTL keeps the key fresh, and the failure-
+triggered refresh remains the backstop for a credential revoked early. With
+no TTL (the default) the helper runs only at startup and after a failure.
+
+The command runs through `sh -c` with `$LLM_CHAT_ENDPOINT` set to the
+endpoint the key is for (useful when one command serves several endpoints —
+after an endpoint switch, the first failed request refreshes the key with
+the new value set). Only the first line of its output is used, since helpers
+commonly print the secret first and metadata after. It inherits stdin, so a
+helper may prompt for a passphrase or a hardware-key touch; it has two
+minutes to finish. A failure at startup is fatal; a failure later is a
+warning and the original API error stands. `-key-cmd` takes precedence over
+`-key` and over the environment.
 
 ### Non-interactive mode
 
