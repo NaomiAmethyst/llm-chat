@@ -248,11 +248,13 @@ func TestKeyTTLRefreshesBeforeRequest(t *testing.T) {
 	srv := keyGatedServer(t, "key2", &hits)
 	s := &Session{
 		client: srv.Client(), baseURL: srv.URL, model: "m",
-		keyCmd: rotatingKeyCmd(t), keyTTL: time.Nanosecond,
+		keyCmd: rotatingKeyCmd(t), keyTTL: time.Hour,
 	}
 	if err := s.initKey(); err != nil { // startup: key1, which the server rejects
 		t.Fatal(err)
 	}
+	// Expire the key explicitly instead of relying on the platform clock resolution.
+	s.keyFetched = time.Now().Add(-2 * s.keyTTL)
 	s.push("user", "hi")
 
 	var content string
@@ -331,11 +333,13 @@ func TestKeyTTLAndFailureRetryCoexist(t *testing.T) {
 	srv := keyGatedServer(t, "key3", &hits)
 	s := &Session{
 		client: srv.Client(), baseURL: srv.URL, model: "m",
-		keyCmd: rotatingKeyCmd(t), keyTTL: time.Nanosecond,
+		keyCmd: rotatingKeyCmd(t), keyTTL: time.Hour,
 	}
 	if err := s.initKey(); err != nil { // key1
 		t.Fatal(err)
 	}
+	// Expire the key explicitly instead of relying on the platform clock resolution.
+	s.keyFetched = time.Now().Add(-2 * s.keyTTL)
 	s.push("user", "hi")
 	captureStdout(t, func() {
 		// key2 from the proactive refresh is still wrong; the failure path
