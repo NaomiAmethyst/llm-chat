@@ -8,7 +8,56 @@ OpenClaw, Ollama, vLLM, llama.cpp, LM Studio, and anything else that speaks
 `golang.org/x/term` + `golang.org/x/sys` as dependencies.
 
 Runs on Linux and macOS (other Unixes supported by `x/term` will likely work
-too).
+too). Windows supports line-based chat and piped input; the raw terminal
+editor is currently Unix-only. On Windows, end each message with a line
+containing only `.` (or pipe input to the program). `-key-cmd` requires
+`sh` on PATH, for example from Git for Windows.
+
+## Downloads and containers
+
+[GitHub Releases](https://github.com/NaomiAmethyst/llm-chat/releases) provide
+Linux, Windows, and macOS archives for amd64 (Intel/AMD) and arm64 (including
+Apple Silicon), plus `SHA256SUMS`. macOS archives use Go's `darwin` OS name;
+Windows archives contain `llm-chat.exe`. Binaries are built with CGO disabled.
+The macOS and Windows binaries are not signed or notarized.
+
+Each successful [CI run](https://github.com/NaomiAmethyst/llm-chat/actions/workflows/ci.yml)
+also uploads these archives as workflow artifacts. Push a `v*` tag (for example
+`v1.0.0`) to publish a GitHub Release; tags containing `-` become prereleases.
+
+The container is published to `ghcr.io/naomiamethyst/llm-chat` for
+`linux/amd64` and `linux/arm64`. `latest` follows successful builds of `main`;
+`v*` tags retain their exact name, and `sha-<short commit>` identifies a build.
+Pull requests build the image without publishing it. Publishing uses the
+repository's built-in `GITHUB_TOKEN` with `packages: write`; no registry secret
+is needed. For anonymous pulls, set the GHCR package visibility to public after
+its first publication ([GitHub package visibility documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)).
+
+```sh
+# Interactive chat; credentials are forwarded from your environment.
+docker run --rm -it -e OPENROUTER_API_KEY \
+  ghcr.io/naomiamethyst/llm-chat:latest -model anthropic/claude-sonnet-4.5
+
+# Pipe input; use -i without -t.
+printf 'Hello\n' | docker run --rm -i -e OPENROUTER_API_KEY \
+  ghcr.io/naomiamethyst/llm-chat:latest -model anthropic/claude-sonnet-4.5
+
+# Persist /save output in the current directory.
+docker run --rm -it --user "$(id -u):$(id -g)" \
+  -v "$PWD:/data" -e OPENROUTER_API_KEY \
+  ghcr.io/naomiamethyst/llm-chat:latest
+```
+
+The final image starts `FROM scratch` and contains the static executable,
+CA certificates for HTTPS, timezone data, and the license. Its working
+directory is `/data`. There is no shell or credential helper in the image,
+so `-key-cmd` is unavailable; pass keys through environment variables instead.
+For a local build, run `docker build -t llm-chat .`. To build both architectures:
+
+```sh
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/naomiamethyst/llm-chat:dev .
+```
 
 ## Build
 
@@ -57,7 +106,7 @@ git diff | ./llm-chat -system "write a commit message"
 | `-temperature` | endpoint default | sampling temperature |
 | `-max-tokens` | endpoint default | max completion tokens |
 | `-no-stream` | off | disable streaming |
-| `-interactive` | stdin is a tty | terminal editor session; `-interactive=false` reads `.`-terminated messages from stdin |
+| `-interactive` | stdin is a tty; false on Windows | terminal editor session; `-interactive=false` reads `.`-terminated messages from stdin |
 | `-color` | on when interactive | ANSI colors + markdown rendering; `-color=false` disables all decorative ANSI |
 | `-load` | *(none)* | load a conversation at startup (JSON save or copied transcript) |
 
@@ -116,7 +165,8 @@ warning and the original API error stands. `-key-cmd` takes precedence over
 
 ### Non-interactive mode
 
-With `-interactive=false` (the default when stdin is not a tty), the terminal
+With `-interactive=false` (the default when stdin is not a tty, and always on
+Windows), the terminal
 editor is not used. Instead stdin carries one or more messages, each ended by
 a line containing only `.` — history is kept between them, so this is a real
 multi-turn conversation. EOF sends any pending text as the final message, so

@@ -25,7 +25,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -47,15 +46,6 @@ func disableColors() {
 
 func isTerminal(fd uintptr) bool {
 	return term.IsTerminal(int(fd))
-}
-
-// stdinHasData reports whether stdin has bytes ready within the timeout.
-// The editor uses it to batch redraws during pastes, to tell a typed Enter
-// from a pasted newline, and to tell a bare Esc from an escape sequence.
-func stdinHasData(d time.Duration) bool {
-	fds := []unix.PollFd{{Fd: 0, Events: unix.POLLIN}}
-	n, err := unix.Poll(fds, int(d.Milliseconds()))
-	return err == nil && n > 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,13 +1442,17 @@ func main() {
 	temperature := flag.Float64("temperature", -1, "sampling temperature (endpoint default if unset)")
 	maxTokens := flag.Int("max-tokens", 0, "max completion tokens (endpoint default if unset)")
 	noStream := flag.Bool("no-stream", false, "disable streaming responses")
-	interactiveF := flag.Bool("interactive", isTerminal(os.Stdin.Fd()),
-		"interactive session with the terminal editor (default: stdin is a tty); when false, read '.'-terminated messages from stdin")
+	interactiveF := flag.Bool("interactive", supportsTerminalEditor && isTerminal(os.Stdin.Fd()),
+		"interactive session with the terminal editor (default: stdin is a tty, except on Windows); when false, read '.'-terminated messages from stdin")
 	colorF := flag.Bool("color", true, "ANSI colors and markdown rendering (default: true when interactive and stdout is a tty)")
 	loadPath := flag.String("load", "", "load a conversation at startup (JSON save or copied transcript)")
 	flag.Parse()
 
 	interactive := *interactiveF
+	if interactive && !supportsTerminalEditor {
+		fmt.Fprintln(os.Stderr, "error: the terminal editor is not supported on Windows; use -interactive=false and end each message with a line containing only '.'")
+		os.Exit(1)
+	}
 	var colorSet, urlSet, keySet bool
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
