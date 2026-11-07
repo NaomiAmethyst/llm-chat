@@ -191,6 +191,8 @@ printf 'summarize the plan\n.\nnow list the risks\n.\n' | ./llm-chat
 | `/retry` | resend the last user message (e.g. after an error or `/model` switch) |
 | `/save [file]` | save the conversation — markdown, or JSON if the name ends in `.json` |
 | `/load [file]` | load a conversation (JSON save or copied transcript); no file = paste it at the prompt |
+| `/attach PATH` | start a message with an `<attach:PATH>` token for the file (see below) |
+| `/paste` | start a message with the clipboard's image attached |
 | `/quit` | exit (Ctrl+D also works) |
 
 ### Input editor
@@ -206,6 +208,9 @@ The prompt is a multi-line editor:
   input**; Ctrl+L redraws the screen.
 - **Pasting** multi-line text inserts it literally, ready for editing before
   you send.
+- **Ctrl+V** (or **Alt+V**, for terminals that keep Ctrl+V for themselves)
+  attaches the clipboard's image at the cursor; **dragging an image file**
+  onto the terminal attaches it too. See *Attachments*.
 - Start a message with `//` to send a literal message beginning with `/`.
 
 Your message is composed on its own line(s) below the `you ❯` marker, with no
@@ -256,6 +261,51 @@ prompt). Run `/load` with no argument to paste a transcript directly at a
 
 The horizontal rule after each AI turn also gives copied transcripts an
 unambiguous shape for the parser.
+
+### Attachments
+
+An `<attach:PATH>` token anywhere in a message attaches that file:
+
+```
+you ❯
+what's wrong in this screenshot? <attach:~/Pictures/error.png>
+and does it match the log? <attach:/var/log/app.log>
+[sent: 2026-10-31 12:00:00; 112 bytes; 2 attachments, 341 KB]
+```
+
+- **Images** (PNG, JPEG, GIF, WebP) are sent as `image_url` content parts and
+  **PDFs** as `file` parts, at the token's place in the message — these need a
+  model and endpoint that accept them. **Text files** are inlined as a fenced
+  block, so they work with any model. Other binaries are refused. The limit
+  is 20 MB per file (1 MB for inlined text).
+- Ways to add one: type the token; `/attach PATH`, which starts the next
+  message with the token so you can keep typing; **Ctrl+V** / **Alt+V** or
+  `/paste` for a clipboard image; or drag an image file onto the terminal.
+  Quote paths containing spaces or `>` as `<attach:"PATH">`, and write
+  `<<attach:` for a literal `<attach:`. A file that can't be attached stops
+  the send with an error and hands the message back for fixing.
+- **Snapshots.** Each file is copied into a content-addressed cache
+  (`~/.cache/llm-chat/files` on Linux, or `$LLM_CHAT_CACHE_DIR/files`) when the
+  message is sent, and the message refers to that copy by SHA-256. Editing or
+  deleting the file afterwards never changes what an earlier message said,
+  and the request prefix stays stable for prompt caching. Pasted images live
+  only in the cache.
+- **Round trips.** The token is plain text, so it survives copied
+  transcripts; JSON saves also record each snapshot's hash, so a reload uses
+  the original bytes even if the file has since changed.
+- **Clipboard** reading uses `wl-paste` (Wayland) or `xclip` (X11) on Linux
+  and `osascript` on macOS; it isn't available on Windows yet. Over SSH the
+  clipboard is the remote one, so attach files by path there.
+
+**What never gets uploaded.** Only text *you* send is scanned for tokens.
+Assistant replies never are, so a model cannot make llm-chat read a file by
+mentioning it, and a token with no recorded snapshot is always sent as plain
+text. A loaded conversation restores attachments without asking only when
+the bytes are verified against a recorded hash or the file is one llm-chat
+cached itself; any other path in a JSON file or transcript was chosen by
+whoever wrote it, so interactive sessions ask before reading it, and
+non-interactive ones refuse. Declined or unavailable tokens are escaped
+(`<<attach:`) and sent as text, with a warning.
 
 ### Markdown rendering
 

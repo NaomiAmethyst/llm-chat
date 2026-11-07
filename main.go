@@ -5,7 +5,8 @@
 // (OpenRouter, OpenClaw, Ollama, vLLM, llama.cpp, ...). No tools, no TUI,
 // and only golang.org/x/{term,sys} as dependencies: a raw-mode multi-line
 // editor, streamed responses with ANSI markdown highlighting, token
-// accounting, conversation save/load, and full control of the system prompt.
+// accounting, conversation save/load, file and clipboard-image attachments,
+// and full control of the system prompt.
 package main
 
 import (
@@ -75,6 +76,14 @@ type editor struct {
 	buf     []rune
 	cur     int // cursor index into buf
 	lastRow int // visual row of the cursor, counted from the prompt line
+
+	prefill string                 // text the next edit starts with (/attach, /paste)
+	onPaste func() (string, error) // Ctrl+V / Alt+V: returns a token to insert
+
+	// A batch is the input that arrives together before a redraw; a paste
+	// or a file dragged onto the terminal lands as one batch of inserts.
+	batchStart int  // cursor before the batch's first insert, or -1
+	batchDirty bool // the batch did more than insert text
 }
 
 // layout maps every cursor position (0..len(buf)) to its visual row/column
@@ -184,6 +193,53 @@ func (e *editor) deleteWordBack() {
 	e.deleteRange(i, e.cur)
 }
 
+// notify prints a message above the prompt and redraws the prompt below it,
+// so feedback does not corrupt the edit region.
+func (e *editor) notify(msg string) {
+	var b strings.Builder
+	b.WriteString("\r")
+	if e.lastRow > 0 {
+		fmt.Fprintf(&b, "\x1b[%dA", e.lastRow)
+	}
+	fmt.Fprintf(&b, "\x1b[J%s%s%s\r\n", cDim, msg, cReset)
+	os.Stdout.WriteString(b.String())
+	e.lastRow = 0
+}
+
+func (e *editor) insertString(s string) {
+	for _, r := range s {
+		e.insert(r)
+	}
+}
+
+func (e *editor) pasteImage() {
+	if e.onPaste == nil {
+		return
+	}
+	tok, err := e.onPaste()
+	if err != nil {
+		e.notify("paste: " + err.Error())
+		return
+	}
+	e.insertString(tok + " ")
+}
+
+// convertDrop replaces a batch that is exactly a dragged image path with an
+// attachment token. Typing cannot produce a whole path within one batch.
+func (e *editor) convertDrop() {
+	start := e.batchStart
+	if start < 0 || e.batchDirty || e.cur-start < 2 {
+		return
+	}
+	path := draggedImagePath(string(e.buf[start:e.cur]))
+	if path == "" {
+		return
+	}
+	tok := []rune(formatAttachToken(path) + " ")
+	e.buf = append(e.buf[:start], append(tok, e.buf[e.cur:]...)...)
+	e.cur = start + len(tok)
+}
+
 // finish parks the cursor after the last character, moves to a fresh line,
 // and returns the buffer contents.
 func (e *editor) finish() string {
@@ -227,6 +283,10 @@ func (e *editor) handleEscape() {
 		return
 	}
 	b1, err := e.in.ReadByte()
+	if err == nil && b1 == 'v' { // Alt+V, for terminals that keep Ctrl+V
+		e.pasteImage()
+		return
+	}
 	if err != nil || (b1 != '[' && b1 != 'O') {
 		return
 	}
@@ -282,7 +342,9 @@ func (e *editor) edit() (msg string, eof bool) {
 		return "", true
 	}
 	defer term.Restore(int(os.Stdin.Fd()), old)
-	e.buf, e.cur, e.lastRow = e.buf[:0], 0, 0
+	e.buf = append(e.buf[:0], []rune(e.prefill)...)
+	e.cur, e.lastRow, e.prefill = len(e.buf), 0, ""
+	e.batchStart, e.batchDirty = -1, false
 	e.render()
 	for {
 		r, _, err := e.in.ReadRune()
@@ -290,6 +352,7 @@ func (e *editor) edit() (msg string, eof bool) {
 			os.Stdout.WriteString("\r\n")
 			return "", true
 		}
+		before, inserted := e.cur, false
 		switch {
 		case r == 0x04: // Ctrl+D
 			if len(e.buf) == 0 {
@@ -306,6 +369,7 @@ func (e *editor) edit() (msg string, eof bool) {
 				return e.finish(), false
 			}
 			e.insert('\n')
+			inserted = true
 		case r == 0x03: // Ctrl+C clears the input
 			e.buf, e.cur = e.buf[:0], 0
 		case r == 0x7f || r == 0x08: // Backspace
@@ -327,18 +391,29 @@ func (e *editor) edit() (msg string, eof bool) {
 		case r == 0x0c: // Ctrl+L
 			os.Stdout.WriteString("\x1b[H\x1b[2J")
 			e.lastRow = 0
+		case r == 0x16: // Ctrl+V: attach the clipboard's image
+			e.pasteImage()
 		case r == 0x1b:
 			e.handleEscape()
 		case r == '\t':
 			for i := 0; i < 4; i++ {
 				e.insert(' ')
 			}
+			inserted = true
 		case r < 0x20: // other control characters
 		default:
 			e.insert(r)
+			inserted = true
+		}
+		if !inserted {
+			e.batchDirty = true
+		} else if e.batchStart < 0 {
+			e.batchStart = before
 		}
 		// Skip redraws while more input (typically a paste) is pending.
 		if e.in.Buffered() == 0 && !stdinHasData(batchWait) {
+			e.convertDrop()
+			e.batchStart, e.batchDirty = -1, false
 			e.render()
 		}
 	}
@@ -348,8 +423,23 @@ func (e *editor) edit() (msg string, eof bool) {
 // API types
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string        `json:"role"`
+	Content string        `json:"content"`
+	attach  []attachment  // user snapshots, expanded just before sending
+	parts   []contentPart // set by expandAttachments; replaces Content on the wire
+}
+
+func (m Message) MarshalJSON() ([]byte, error) {
+	if m.parts != nil {
+		return json.Marshal(struct {
+			Role    string        `json:"role"`
+			Content []contentPart `json:"content"`
+		}{m.Role, m.parts})
+	}
+	return json.Marshal(struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{m.Role, m.Content})
 }
 
 type chatRequest struct {
@@ -430,9 +520,10 @@ func buildDefaultSystem(color, interactive bool) string {
 }
 
 type histMsg struct {
-	Role    string
-	Content string
-	At      time.Time
+	Role        string
+	Content     string
+	At          time.Time
+	Attachments []attachment // user messages only; one per <attach:> token
 }
 
 type Session struct {
@@ -456,6 +547,10 @@ type Session struct {
 	// stays stable (and cacheable by the provider) across turns
 	history []histMsg
 
+	// confirmAttach asks whether files named by a loaded conversation may be
+	// read and sent; nil (non-interactive) always declines.
+	confirmAttach func(paths []string) bool
+
 	// token accounting
 	totalIn     int
 	totalOut    int
@@ -472,6 +567,9 @@ func approxMessages(msgs []Message) int {
 	n := 0
 	for _, m := range msgs {
 		n += approxTokens(m.Content) + 4 // ~4 tokens of per-message framing
+		for _, a := range m.attach {
+			n += a.estimate()
+		}
 	}
 	return n
 }
@@ -483,8 +581,20 @@ func durStr(d time.Duration) string {
 	return d.Round(100 * time.Millisecond).String()
 }
 
-func printSent(msg string) {
-	fmt.Printf("%s[sent: %s; %d bytes]%s\n", cDim, time.Now().Format("2006-01-02 15:04:05"), len(msg), cReset)
+func printSent(msg string, atts []attachment) {
+	extra := ""
+	if len(atts) > 0 {
+		var size int64
+		for _, a := range atts {
+			size += a.Size
+		}
+		noun := "attachments"
+		if len(atts) == 1 {
+			noun = "attachment"
+		}
+		extra = fmt.Sprintf("; %d %s, %s", len(atts), noun, humanSize(size))
+	}
+	fmt.Printf("%s[sent: %s; %d bytes%s]%s\n", cDim, time.Now().Format("2006-01-02 15:04:05"), len(msg), extra, cReset)
 }
 
 func withCommas(n int) string {
@@ -625,13 +735,31 @@ func (s *Session) push(role, content string) {
 	s.history = append(s.history, histMsg{Role: role, Content: content, At: time.Now()})
 }
 
+// pushUser records a message the user wrote, snapshotting the files its
+// <attach:> tokens name. This is the only place tokens become attachments.
+func (s *Session) pushUser(text string) error {
+	atts, err := resolveAttachments(text)
+	if err != nil {
+		return err
+	}
+	s.history = append(s.history, histMsg{Role: "user", Content: text, At: time.Now(), Attachments: atts})
+	return nil
+}
+
+func (s *Session) lastAttachments() []attachment {
+	if n := len(s.history); n > 0 {
+		return s.history[n-1].Attachments
+	}
+	return nil
+}
+
 func (s *Session) messages() []Message {
 	msgs := make([]Message, 0, len(s.history)+1)
 	if s.sysExpanded != "" {
 		msgs = append(msgs, Message{Role: "system", Content: s.sysExpanded})
 	}
 	for _, h := range s.history {
-		msgs = append(msgs, Message{Role: h.Role, Content: h.At.Format("[2006-01-02 15:04:05] ") + h.Content})
+		msgs = append(msgs, Message{Role: h.Role, Content: h.At.Format("[2006-01-02 15:04:05] ") + h.Content, attach: h.Attachments})
 	}
 	return msgs
 }
@@ -722,7 +850,11 @@ func (s *Session) send(ctx context.Context) (string, *Usage, error) {
 }
 
 func (s *Session) sendOnce(ctx context.Context) (string, *Usage, error) {
-	creq := chatRequest{Model: s.model, Messages: s.messages(), Stream: s.stream}
+	msgs := s.messages()
+	if err := expandAttachments(msgs); err != nil {
+		return "", nil, err
+	}
+	creq := chatRequest{Model: s.model, Messages: msgs, Stream: s.stream}
 	if s.stream {
 		creq.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
@@ -1001,9 +1133,10 @@ func (s *Session) saveTranscript(path string) error {
 // conversation save/load
 
 type savedMsg struct {
-	Role    string    `json:"role"`
-	Content string    `json:"content"`
-	At      time.Time `json:"at,omitzero"`
+	Role        string       `json:"role"`
+	Content     string       `json:"content"`
+	At          time.Time    `json:"at,omitzero"`
+	Attachments []attachment `json:"attachments,omitempty"`
 }
 
 type savedChat struct {
@@ -1017,7 +1150,7 @@ type savedChat struct {
 func (s *Session) saveJSON(path string) error {
 	c := savedChat{Endpoint: s.baseURL, Model: s.model, System: &s.system, Saved: time.Now()}
 	for _, h := range s.history {
-		c.Messages = append(c.Messages, savedMsg{Role: h.Role, Content: h.Content, At: h.At})
+		c.Messages = append(c.Messages, savedMsg{Role: h.Role, Content: h.Content, At: h.At, Attachments: h.Attachments})
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -1048,6 +1181,7 @@ func (s *Session) apply(c savedChat) string {
 		s.model = c.Model
 	}
 	s.history = nil
+	var recorded [][]attachment // aligned with s.history
 	for _, m := range c.Messages {
 		if m.Role == "" || strings.TrimSpace(m.Content) == "" {
 			continue
@@ -1057,7 +1191,9 @@ func (s *Session) apply(c savedChat) string {
 			at = time.Now()
 		}
 		s.history = append(s.history, histMsg{Role: m.Role, Content: m.Content, At: at})
+		recorded = append(recorded, m.Attachments)
 	}
+	attachSummary := s.restoreAttachments(recorded)
 	s.lastPrompt = 0
 	s.refreshSystem()
 	summary := fmt.Sprintf("loaded %d messages", len(s.history))
@@ -1069,6 +1205,9 @@ func (s *Session) apply(c savedChat) string {
 	}
 	if c.System != nil {
 		summary += fmt.Sprintf("; system prompt %d chars", len(s.system))
+	}
+	if attachSummary != "" {
+		summary += "; " + attachSummary
 	}
 	return summary
 }
@@ -1204,6 +1343,8 @@ func printHelp() {
   /load [file]       load a conversation from a JSON save or a transcript
                      copied from the terminal; with no file, paste it at the
                      prompt and end with Ctrl+D
+  /attach PATH       start a message with an <attach:PATH> token for the file
+  /paste             start a message with the clipboard's image attached
   /quit              exit (or Ctrl+D)
 
 input
@@ -1216,19 +1357,33 @@ input
   Start with // to send a literal message beginning with "/".
   While a response is streaming, Ctrl+C interrupts it.
   Each message is sent to the model with a [YYYY-MM-DD HH:MM:SS] prefix.
+
+attachments
+  <attach:PATH> in a message attaches a file: images and PDFs are sent as
+  content parts, text files are inlined. Quote paths with spaces or '>' as
+  <attach:"PATH">; write <<attach: for a literal "<attach:". Files are
+  snapshotted when the message is sent. Ctrl+V or Alt+V pastes a clipboard
+  image at the cursor; dragging an image file onto the terminal attaches it.
 ` + cReset)
 }
 
-// handleCommand runs a slash command; retry asks the caller to resend the
-// last user message, paste asks it to capture a pasted conversation to load.
-func handleCommand(s *Session, input string) (quit, retry, paste bool) {
+// cmdResult tells the input loop what to do after a slash command.
+type cmdResult struct {
+	quit      bool
+	retry     bool   // resend the last user message
+	loadPaste bool   // capture a pasted conversation to load
+	prefill   string // text to start the next message with
+}
+
+// handleCommand runs a slash command.
+func handleCommand(s *Session, input string) cmdResult {
 	cmd := strings.Fields(input)[0]
 	arg := strings.TrimSpace(strings.TrimPrefix(input, cmd))
 	switch cmd {
 	case "/help", "/?":
 		printHelp()
 	case "/quit", "/exit", "/q":
-		return true, false, false
+		return cmdResult{quit: true}
 	case "/model":
 		if arg == "" {
 			fmt.Printf("%s%s%s\n", cMag, s.model, cReset)
@@ -1299,7 +1454,7 @@ func handleCommand(s *Session, input string) (quit, retry, paste bool) {
 			s.history = s.history[:n-1]
 		}
 		if n := len(s.history); n > 0 && s.history[n-1].Role == "user" {
-			return false, true, false
+			return cmdResult{retry: true}
 		}
 		fmt.Printf("%snothing to retry%s\n", cDim, cReset)
 	case "/save":
@@ -1314,7 +1469,7 @@ func handleCommand(s *Session, input string) (quit, retry, paste bool) {
 		}
 	case "/load":
 		if arg == "" {
-			return false, false, true
+			return cmdResult{loadPaste: true}
 		}
 		summary, err := s.loadFromFile(arg)
 		if err != nil {
@@ -1322,13 +1477,54 @@ func handleCommand(s *Session, input string) (quit, retry, paste bool) {
 		} else {
 			fmt.Printf("%s%s%s\n", cDim, summary, cReset)
 		}
+	case "/attach":
+		if arg == "" {
+			fmt.Printf("%susage: /attach PATH%s\n", cDim, cReset)
+			break
+		}
+		if len(arg) >= 2 && (arg[0] == '"' || arg[0] == '\'') && arg[len(arg)-1] == arg[0] {
+			arg = arg[1 : len(arg)-1]
+		}
+		a, err := snapshotFile(arg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%serror:%s attach %s: %v\n", cRed, cReset, arg, err)
+			break
+		}
+		return cmdResult{prefill: formatAttachToken(a.Path) + " "}
+	case "/paste":
+		tok, err := pasteClipboardImage()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%serror:%s %v\n", cRed, cReset, err)
+			break
+		}
+		return cmdResult{prefill: tok + " "}
 	default:
 		fmt.Printf("%sunknown command %s — /help for help, // to send a literal /%s\n", cDim, cmd, cReset)
 	}
-	return false, false, false
+	return cmdResult{}
 }
 
 // ---------------------------------------------------------------------------
+
+// confirmAttachPaths asks, on a cooked terminal, whether a loaded
+// conversation may attach files outside llm-chat's cache.
+func confirmAttachPaths(endpoint string, paths []string) bool {
+	fmt.Printf("%sThe loaded conversation attaches files that llm-chat did not snapshot:%s\n", cRed, cReset)
+	for _, p := range paths {
+		fmt.Printf("  %s\n", sanitize(displayPath(p)))
+	}
+	fmt.Printf("Read these files and send them to %s with the conversation? [y/N] ", endpoint)
+	var b strings.Builder
+	buf := make([]byte, 1)
+	for { // byte at a time, so nothing is read past the answer
+		if n, err := os.Stdin.Read(buf); n == 0 || err != nil || buf[0] == '\n' {
+			break
+		}
+		b.WriteByte(buf[0])
+	}
+	answer := strings.ToLower(strings.TrimSpace(b.String()))
+	return answer == "y" || answer == "yes"
+}
 
 // readDotMessage reads stdin lines until a line holding only "." (ends one
 // message) or EOF (eof=true; any pending text is the final message).
@@ -1368,7 +1564,10 @@ func runNonInteractive(s *Session, initial string, sigc chan os.Signal) {
 		msg = strings.TrimSpace(msg)
 		if msg != "" {
 			sent = true
-			s.push("user", msg)
+			if err := s.pushUser(msg); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() {
@@ -1503,6 +1702,9 @@ func main() {
 		keyTTL:      *keyTTL,
 		defaultSys:  builtDefault,
 	}
+	if interactive {
+		s.confirmAttach = func(paths []string) bool { return confirmAttachPaths(s.baseURL, paths) }
+	}
 	s.resolveKey()
 	if s.keyTTL < 0 {
 		fmt.Fprintln(os.Stderr, "error: -key-ttl cannot be negative")
@@ -1569,14 +1771,18 @@ func main() {
 
 	if initial != "" {
 		fmt.Printf("%syou ❯%s\n%s\n", cCyan+cBold, cReset, initial)
-		printSent(initial)
-		s.push("user", initial)
+		if err := s.pushUser(initial); err != nil {
+			fmt.Fprintf(os.Stderr, "%serror:%s %v\n", cRed, cReset, err)
+			os.Exit(1)
+		}
+		printSent(initial, s.lastAttachments())
 		s.runTurn(sigc)
 	}
 
 	ed := &editor{
-		in:     rd,
-		prompt: cCyan + cBold + "you ❯" + cReset,
+		in:      rd,
+		prompt:  cCyan + cBold + "you ❯" + cReset,
+		onPaste: pasteClipboardImage,
 	}
 	for {
 		raw, eof := ed.edit()
@@ -1588,14 +1794,15 @@ func main() {
 			continue
 		}
 		if !strings.Contains(msg, "\n") && strings.HasPrefix(msg, "/") && !strings.HasPrefix(msg, "//") {
-			quit, retry, paste := handleCommand(s, msg)
-			if quit {
+			res := handleCommand(s, msg)
+			if res.quit {
 				break
 			}
-			if retry {
+			if res.retry {
 				s.runTurn(sigc)
 			}
-			if paste {
+			ed.prefill = res.prefill
+			if res.loadPaste {
 				fmt.Printf("%spaste a transcript or JSON below, then Ctrl+D (Ctrl+D on empty input cancels)%s\n", cDim, cReset)
 				oldPrompt := ed.prompt
 				ed.prompt = cMag + cBold + "paste ❯" + cReset
@@ -1614,8 +1821,12 @@ func main() {
 		if strings.HasPrefix(msg, "//") { // "//literal" escape
 			msg = msg[1:]
 		}
-		printSent(msg)
-		s.push("user", msg)
+		if err := s.pushUser(msg); err != nil {
+			fmt.Fprintf(os.Stderr, "%serror:%s %v\n", cRed, cReset, err)
+			ed.prefill = raw // give the message back to fix the token
+			continue
+		}
+		printSent(msg, s.lastAttachments())
 		s.runTurn(sigc)
 	}
 }
